@@ -11,6 +11,11 @@ import {CountersUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Cou
 //Only used for rescues.
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 
+interface IChessSVG {
+    function tokenURIFromGameState(uint256 gameState, uint256 tokenId, bool flipped)
+        external pure returns (string memory);
+}
+
 contract Treasure is
     Initializable,
     ERC721Upgradeable,
@@ -33,6 +38,7 @@ contract Treasure is
         uint16 achievement2; //If these are onchain, it can be something that future gov token...
         uint16 achievement3; //...holders can vote on later.
         bool color; //0 white, 1 black
+        uint256 gameState;   // board state for on-chain SVG rendering
     }
 
     /// NFT storage
@@ -42,6 +48,9 @@ contract Treasure is
 
     // Contract Level Metadata.
     string public contractMetaData;
+
+    // On-chain SVG renderer
+    address public svgRenderer;
 
     //Events
     event GameMinted(address to, uint256 id, string uri, bytes32 movesHash);
@@ -65,6 +74,10 @@ contract Treasure is
         _;
     }
 
+    function setSvgRenderer(address _renderer) public onlyAdmin {
+        svgRenderer = _renderer;
+    }
+
     function mint(
         address player,
         string memory _tokenURI,
@@ -73,7 +86,8 @@ contract Treasure is
         uint16 _achievement1,
         uint16 _achievement2,
         uint16 _achievement3,
-        bool _color
+        bool _color,
+        uint256 _gameState
     ) public onlyAdmin returns (uint256) {
         require(
             movesHashToId[_moveHash] == 0,
@@ -92,7 +106,8 @@ contract Treasure is
             _achievement1,
             _achievement2,
             _achievement3,
-            _color
+            _color,
+            _gameState
         );
         games[newItemId] = newGame;
         originalPlayers[newItemId] = player;
@@ -180,7 +195,8 @@ contract Treasure is
         public
         onlyOwner
     {
-        to.transfer(amount);
+        (bool ok,) = to.call{value: amount}("");
+        require(ok, "ETH transfer failed");
         emit RescuedEther(to, amount);
     }
 
@@ -206,9 +222,16 @@ contract Treasure is
         public
         view
         virtual
-        override(ERC721URIStorageUpgradeable, ERC721Upgradeable)
+        override(ERC721Upgradeable, ERC721URIStorageUpgradeable)
         returns (string memory)
     {
+        if (svgRenderer != address(0) && games[tokenId].gameState != 0) {
+            return IChessSVG(svgRenderer).tokenURIFromGameState(
+                games[tokenId].gameState,
+                tokenId,
+                games[tokenId].color  // flipped = black's perspective
+            );
+        }
         return super.tokenURI(tokenId);
     }
 

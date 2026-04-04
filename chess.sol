@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
 
-pragma solidity ^0.7.6;
-import "../libraries/SafeMath.sol";
-import "../libraries/Math.sol";
+pragma solidity ^0.8.20;
 
 contract Chess {
-    using SafeMath for uint256;
 
     uint8 constant empty_const  = 0x0;
     uint8 constant pawn_const   = 0x1; // 001
@@ -25,7 +22,7 @@ contract Chess {
     uint32 constant king_pos_zero_mask = 0xffff00ff;
     uint16 constant king_pos_bit       = 8;
     /**
-        @dev For castling masks, mask only the last bit of an uint8, to block any under/overflows.
+        @dev    For castling masks, mask only the last bit of an uint8, to block any under/overflows.
      */
     uint32 constant rook_king_side_move_mask = 0x00800000;
     uint16 constant rook_king_side_move_bit = 16;
@@ -127,13 +124,43 @@ contract Chess {
             // Assumes that signatures have been checked and moves are in correct order
             outcome = ((moves.length % 2) == 1) != currentTurnBlack ? black_win_outcome : white_win_outcome;
         } else {
-            // Check entire game            
-            for (uint256 i = 0; i < moves.length; i++)
+            // Check entire game
+            // 50-move rule tracking
+            uint16 halfmoveClock = 0;
+
+            // Threefold/fivefold repetition tracking
+            bytes32[] memory posHashes = new bytes32[](moves.length + 1);
+            uint8[] memory posCounts = new uint8[](moves.length + 1);
+            uint256 uniquePos = 0;
+
+            for (uint256 i = 0; i < moves.length; )
             {
-                (gameState, opponentState, playerState) = verifyExecuteMove(gameState, moves[i], playerState, opponentState, currentTurnBlack);
+                uint16 move = moves[i];
+
+                // Record position for repetition detection (before move)
+                {
+                    bytes32 posHash = keccak256(abi.encodePacked(gameState, playerState, opponentState, currentTurnBlack));
+                    (bool isDraw, uint256 newUniquePos) = _checkRepetition(posHashes, posCounts, uniquePos, posHash);
+                    uniquePos = newUniquePos;
+                    if (isDraw) {
+                        return (draw_outcome, gameState, playerState, opponentState);
+                    }
+                }
+
+                // 50-move rule check (only for normal moves)
+                if (move < request_draw_const) {
+                    halfmoveClock = _updateHalfmoveClock(gameState, move, halfmoveClock);
+                    // 75-move automatic draw (FIDE Article 9.6)
+                    if (halfmoveClock >= 150) {
+                        return (draw_outcome, gameState, playerState, opponentState);
+                    }
+                }
+
+                (gameState, opponentState, playerState) = verifyExecuteMove(gameState, move, playerState, opponentState, currentTurnBlack);
                 require (!checkForCheck(gameState, opponentState), "inv check");
                 //require (outcome == 0 || i == (moves.length - 1), "Excesive moves");
                 currentTurnBlack = !currentTurnBlack;
+                unchecked { i++; }
             }
             uint8 endgameOutcome = checkEndgame(gameState, playerState, opponentState);
             if (endgameOutcome == 2) {
@@ -142,6 +169,53 @@ contract Chess {
                 outcome = draw_outcome;
             }
 
+        }
+    }
+
+    /**
+        @dev Helper: checks and updates repetition tracking arrays.
+        @return isDraw true if fivefold repetition detected
+        @return newUniquePos updated count of unique positions
+     */
+    function _checkRepetition(
+        bytes32[] memory posHashes,
+        uint8[] memory posCounts,
+        uint256 uniquePos,
+        bytes32 posHash
+    ) internal pure returns (bool isDraw, uint256 newUniquePos) {
+        for (uint256 pi = 0; pi < uniquePos; pi++) {
+            if (posHashes[pi] == posHash) {
+                unchecked { posCounts[pi]++; }
+                if (posCounts[pi] >= 4) { // 5-fold = automatic (4 repetitions after initial = 5 total)
+                    return (true, uniquePos);
+                }
+                return (false, uniquePos);
+            }
+        }
+        posHashes[uniquePos] = posHash;
+        posCounts[uniquePos] = 1;
+        unchecked { uniquePos++; }
+        return (false, uniquePos);
+    }
+
+    /**
+        @dev Helper: updates the halfmove clock for the 50-move rule.
+        @return updated halfmove clock value
+     */
+    function _updateHalfmoveClock(
+        uint256 gameState,
+        uint16 move,
+        uint16 halfmoveClock
+    ) internal pure returns (uint16) {
+        uint8 fromPos50 = uint8((move >> 6) & 0x3f);
+        uint8 toPos50 = uint8(move & 0x3f);
+        uint8 movingPiece50 = pieceAtPosition(gameState, fromPos50) & type_mask_const;
+        bool isCapture50 = pieceAtPosition(gameState, toPos50) != empty_const;
+        if (movingPiece50 == pawn_const || isCapture50) {
+            return 0;
+        } else {
+            unchecked { halfmoveClock++; }
+            return halfmoveClock;
         }
     }
 
@@ -158,7 +232,10 @@ contract Chess {
     public pure
     returns (uint256 newGameState, uint32 newPlayerState, uint32 newOpponentState)
     {
-        // TODO: check resigns and other stuff first
+        // Handle special moves before piece validation
+        if (move == request_draw_const || move == accept_draw_const || move == resign_const) {
+            return (gameState, playerState, opponentState);
+        }
         uint8 fromPos = (uint8)((move >> 6) & 0x3f);
         uint8 toPos   = (uint8)(move & 0x3f);
         // uint8 moveExtra   = (uint8)(move >> 12);
@@ -233,9 +310,9 @@ contract Chess {
             // newGameState = invalid_move_constant;
             return (invalid_move_constant, 0x0);
         }
-        uint8 diff = (uint8)(Math.max(fromPos, toPos) - Math.min(fromPos, toPos));
+        uint8 diff = uint8((fromPos > toPos ? fromPos - toPos : toPos - fromPos));
         uint8 pieceToPosition = pieceAtPosition(gameState, toPos);
-        
+
         if (diff == 8 || diff == 16) {
             if (pieceToPosition != 0) {
                 //newGameState = invalid_move_constant;
@@ -447,7 +524,6 @@ contract Chess {
     returns (bool)
     {
         uint256 newGameState;
-        uint256 newPlayerState;
         uint8 toPos;
         uint8 kingPos = (uint8)(playerState >> king_pos_bit); /* Kings position cannot be affected by Queen's movement */
 
@@ -504,7 +580,7 @@ contract Chess {
             }
             if (((gameState >> (toPos << piece_pos_shift_bit)) & 0xF) != 0) break;
         }
-        
+
         // Check down-right
         for ( toPos = fromPos - 7; (toPos < fromPos) && ((toPos & 0x7) > (fromPos & 0x7)); toPos -= 7 ) {
             newGameState = verifyExecuteQueenMove(gameState, fromPos, toPos, currentTurnBlack);
@@ -531,7 +607,6 @@ contract Chess {
     returns (bool)
     {
         uint256 newGameState;
-        uint256 newPlayerState;
         uint8 toPos;
         uint8 kingPos = (uint8)(playerState >> king_pos_bit); /* Kings position cannot be affected by Bishop's movement */
 
@@ -543,7 +618,7 @@ contract Chess {
             }
             if (((gameState >> (toPos << piece_pos_shift_bit)) & 0xF) != 0) break;
         }
-        
+
         // Check up-left
         for ( toPos = fromPos + 7; (toPos < 0x40) && ((toPos & 0x7) < (fromPos & 0x7)); toPos += 7 ) {
             newGameState = verifyExecuteBishopMove(gameState, fromPos, toPos, currentTurnBlack);
@@ -552,7 +627,7 @@ contract Chess {
             }
             if (((gameState >> (toPos << piece_pos_shift_bit)) & 0xF) != 0) break;
         }
-        
+
         // Check down-right
         for ( toPos = fromPos - 7; (toPos < fromPos) && ((toPos & 0x7) > (fromPos & 0x7)); toPos -= 7 ) {
             newGameState = verifyExecuteBishopMove(gameState, fromPos, toPos, currentTurnBlack);
@@ -561,7 +636,7 @@ contract Chess {
             }
             if (((gameState >> (toPos << piece_pos_shift_bit)) & 0xF) != 0) break;
         }
-        
+
         // Check down-left
         for ( toPos = fromPos - 9; (toPos < fromPos) && ((toPos & 0x7) < (fromPos & 0x7)); toPos -= 9 ) {
             newGameState = verifyExecuteBishopMove(gameState, fromPos, toPos, currentTurnBlack);
@@ -579,7 +654,6 @@ contract Chess {
     returns (bool)
     {
         uint256 newGameState;
-        uint256 newPlayerState;
         uint8 toPos;
         uint8 kingPos = (uint8)(playerState >> king_pos_bit); /* Kings position cannot be affected by Rook's movement */
 
@@ -601,11 +675,11 @@ contract Chess {
             if (((gameState >> (toPos << piece_pos_shift_bit)) & 0xF) != 0) break;
         }
 
-        
+
         // Check up
         for ( toPos = fromPos + 8; toPos < 0x40; toPos += 8 ) {
             newGameState = verifyExecuteRookMove(gameState, fromPos, toPos, currentTurnBlack);
-            
+
             if ((newGameState != invalid_move_constant) && (!pieceUnderAttack(newGameState, kingPos))) {
                 return true;
             }
@@ -679,7 +753,7 @@ contract Chess {
         if ((newGameState != invalid_move_constant) && (!pieceUnderAttack(newGameState, kingPos))) {
             return true;
         }
-        
+
         return false;
     }
 
@@ -731,7 +805,7 @@ contract Chess {
         if ((newGameState != invalid_move_constant) && (!pieceUnderAttack(newGameState, toPos))) {
             return true;
         }
-        
+
         toPos =  fromPos - 8;
         (newGameState, ) = verifyExecuteKingMove(gameState, fromPos, toPos, currentTurnBlack, playerState);
         if ((newGameState != invalid_move_constant) && (!pieceUnderAttack(newGameState, toPos))) {
@@ -774,65 +848,117 @@ contract Chess {
         if ((newGameState != invalid_move_constant) && (!pieceUnderAttack(newGameState, toPos))) {
             return true;
         }
-        /* TODO: Check castling */
+
+        // Check king-side castling
+        {
+            if ((playerState & rook_king_side_move_mask) == 0 && !pieceUnderAttack(gameState, fromPos)) {
+                uint8 targetPos = uint8(uint256(fromPos) + 2);
+                // Check squares between king and rook are empty (king+1 and king+2)
+                if (pieceAtPosition(gameState, uint8(uint256(fromPos) + 1)) == empty_const &&
+                    pieceAtPosition(gameState, targetPos) == empty_const) {
+                    // Check king doesn't pass through check
+                    if (!pieceUnderAttack(gameState, uint8(uint256(fromPos) + 1)) &&
+                        !pieceUnderAttack(gameState, targetPos)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Check queen-side castling
+        {
+            if ((playerState & rook_queen_side_move_mask) == 0 && !pieceUnderAttack(gameState, fromPos)) {
+                uint8 targetPos = uint8(uint256(fromPos) - 2);
+                // Queen-side: squares between king and rook must be empty (king-1, king-2)
+                if (pieceAtPosition(gameState, uint8(uint256(fromPos) - 1)) == empty_const &&
+                    pieceAtPosition(gameState, targetPos) == empty_const) {
+                    if (!pieceUnderAttack(gameState, uint8(uint256(fromPos) - 1)) &&
+                        !pieceUnderAttack(gameState, targetPos)) {
+                        return true;
+                    }
+                }
+            }
+        }
 
         return false;
     }
 
     /**
-        @dev Performs one iteration of recursive search for pieces. 
+        @dev Performs one iteration of recursive search for pieces.
         @param gameState Game state from which start the movements
         @param playerState State of the player
         @param opponentState State of the opponent
         @return returns true if any of the pieces in the current offest has legal moves
      */
-    function searchPiece(uint256 gameState, uint32 playerState, uint32 opponentState, uint8 color, uint16 pBitOffset, uint16 bitSize)
-    public pure
+    function searchPiece(uint256 gameState, uint32 playerState, uint32 opponentState, uint8 color)
+    internal pure
     returns (bool)
     {
-        if (bitSize > piece_bit_size) {
-            uint16 newBitSize = bitSize / 2;
-            uint256 m = ~(full_long_word_mask << newBitSize);
-            uint256 h = (gameState >> (pBitOffset + newBitSize)) & m;            
-            if (h != 0) {
-                if (searchPiece(gameState, playerState, opponentState, color, pBitOffset + newBitSize, newBitSize)) {
-                    return true;
-                }
-            }
-            uint256 l = (gameState >> pBitOffset) & m;
-            if (l != 0) {
-                if (searchPiece(gameState, playerState, opponentState, color, pBitOffset, newBitSize)) {
-                    return true;
-                }
-            }
+        bool isTurnBlack = color != 0;
+        for (uint8 pos = 0; pos < 64; pos++) {
+            uint8 piece = uint8((gameState >> (uint256(pos) * piece_bit_size)) & 0xF);
+            if (piece == 0 || (piece & color_const) != color) continue;
+            uint8 pt = piece & type_mask_const;
+            if (pt == king_const   && checkKingValidMoves(gameState, pos, playerState, isTurnBlack))              return true;
+            if (pt == pawn_const   && checkPawnValidMoves(gameState, pos, playerState, opponentState, isTurnBlack)) return true;
+            if (pt == knight_const && checkKnightValidMoves(gameState, pos, playerState, isTurnBlack))            return true;
+            if (pt == rook_const   && checkRookValidMoves(gameState, pos, playerState, isTurnBlack))              return true;
+            if (pt == bishop_const && checkBishopValidMoves(gameState, pos, playerState, isTurnBlack))            return true;
+            if (pt == queen_const  && checkQueenValidMoves(gameState, pos, playerState, isTurnBlack))             return true;
         }
-        else {
-            uint8 piece = (uint8)((gameState >> pBitOffset) & 0xF);
-            
-            if ((piece > 0) && ((piece & color_const) == color)) {
-                uint8 pos = uint8(pBitOffset / piece_bit_size);
-                bool currentTurnBlack = color != 0;
-                uint8 pieceType = piece & type_mask_const;
-                if ((pieceType == king_const) && checkKingValidMoves(gameState, pos, playerState, currentTurnBlack)) {
-                    return true;
-                }
-                else if ((pieceType == pawn_const) && checkPawnValidMoves(gameState, pos, playerState, opponentState, currentTurnBlack)) {
-                    return true;
-                }
-                else if ((pieceType == knight_const) && checkKnightValidMoves(gameState, pos, playerState, currentTurnBlack)) {
-                    return true;
-                }
-                else if ((pieceType == rook_const) && checkRookValidMoves(gameState, pos, playerState, currentTurnBlack)) {
-                    return true;
-                }
-                else if ((pieceType == bishop_const) && checkBishopValidMoves(gameState, pos, playerState, currentTurnBlack)) {
-                    return true;
-                }
-                else if ((pieceType == queen_const) && checkQueenValidMoves(gameState, pos, playerState, currentTurnBlack)) {
-                    return true;
-                }
+        return false;
+    }
+
+    /**
+        @dev Checks whether the given game state has insufficient material for either side to deliver checkmate.
+        @param gameState current game state
+        @return true if the position is a draw by insufficient material
+     */
+    function checkInsufficientMaterial(uint256 gameState) internal pure returns (bool) {
+        // Count pieces for each side
+        uint8 whitePieces = 0;
+        uint8 blackPieces = 0;
+        uint8 whiteBishopColor = 0; // 1=light, 2=dark, 3=both
+        uint8 blackBishopColor = 0;
+        bool whiteHasBishop = false;
+        bool blackHasBishop = false;
+        bool whiteHasRookQueenPawn = false;
+        bool blackHasRookQueenPawn = false;
+
+        for (uint8 pos = 0; pos < 64; pos++) {
+            uint8 piece = pieceAtPosition(gameState, pos);
+            if (piece == empty_const) continue;
+            uint8 ptype = piece & type_mask_const;
+            bool isBlack = (piece & color_const) != 0;
+
+            if (ptype == pawn_const || ptype == rook_const || ptype == queen_const) {
+                if (isBlack) blackHasRookQueenPawn = true;
+                else whiteHasRookQueenPawn = true;
+            } else if (ptype == bishop_const) {
+                // Square color: (row + col) % 2, where pos = row*8 + col
+                uint8 squareColor = uint8((pos / 8 + pos % 8) % 2 + 1); // 1 or 2
+                if (isBlack) { blackHasBishop = true; blackBishopColor |= squareColor; blackPieces++; }
+                else { whiteHasBishop = true; whiteBishopColor |= squareColor; whitePieces++; }
+            } else if (ptype == knight_const) {
+                if (isBlack) { blackPieces++; }
+                else { whitePieces++; }
             }
+            // Kings not counted
         }
+
+        // If either side has rook/queen/pawn, not insufficient
+        if (whiteHasRookQueenPawn || blackHasRookQueenPawn) return false;
+
+        // K vs K
+        if (whitePieces == 0 && blackPieces == 0) return true;
+
+        // K+B vs K or K+N vs K
+        if ((whitePieces == 1 && blackPieces == 0) || (whitePieces == 0 && blackPieces == 1)) return true;
+
+        // K+B vs K+B, same-color bishops
+        if (whitePieces == 1 && blackPieces == 1 && whiteHasBishop && blackHasBishop) {
+            if (whiteBishopColor == blackBishopColor) return true; // same color squares
+        }
+
         return false;
     }
 
@@ -846,10 +972,13 @@ contract Chess {
     function checkEndgame(uint256 gameState, uint32 playerState, uint32 opponentState)
     public pure
     returns (uint8) {
+        if (checkInsufficientMaterial(gameState)) {
+            return draw_outcome;
+        }
         uint8 kingPiece = (uint8)(gameState >> ((uint8)(playerState >> king_pos_bit) << piece_pos_shift_bit)) & 0xF;
         assert((kingPiece & (~color_const)) == king_const);
-        bool legalMoves = searchPiece(gameState, playerState, opponentState, color_const & kingPiece, 0, 256);
-        // If the player is in check but also 
+        bool legalMoves = searchPiece(gameState, playerState, opponentState, color_const & kingPiece);
+        // If the player is in check but also
         if (checkForCheck(gameState, playerState)) {
             return legalMoves ? 0 : 2;
         }
@@ -882,8 +1011,8 @@ contract Chess {
         // TODO: Remove this getPositionMask usage
         uint256 startMask = getPositionMask(fromPos);
         uint256 endMask = getPositionMask(toPos);
-        int8 x = (int8)(toPos & 0x7) - (int8)(fromPos & 0x7);
-        int8 y = (int8)(toPos >> 3) - (int8)(fromPos >> 3);
+        int8 x = int8(int256(uint256(toPos & 0x7))) - int8(int256(uint256(fromPos & 0x7)));
+        int8 y = int8(int256(uint256(toPos >> 3))) - int8(int256(uint256(fromPos >> 3)));
         uint8 s = 0;
         if ( ((x > 0) && (y > 0)) || ((x < 0) && (y < 0))) s = 9 * 4;
         else if ((x == 0) && (y != 0)) s = 8 * 4;
@@ -917,14 +1046,18 @@ contract Chess {
     public pure
     returns (uint8)
     {
-        return (uint8)(Math.max(fromPos & 0x7, toPos & 0x7) - Math.min(fromPos & 0x7, toPos & 0x7));
+        uint8 a = fromPos & 0x7;
+        uint8 b = toPos & 0x7;
+        return a > b ? a - b : b - a;
     }
 
     function getVerticalMovement(uint8 fromPos, uint8 toPos)
     public pure
     returns (uint8)
     {
-        return (uint8)(Math.max(fromPos >> 3, toPos >> 3) - Math.min(fromPos >> 3, toPos >> 3));
+        uint8 a = fromPos >> 3;
+        uint8 b = toPos >> 3;
+        return a > b ? a - b : b - a;
     }
 
     function checkForCheck(uint256 gameState, uint32 playerState)
@@ -935,7 +1068,7 @@ contract Chess {
         return pieceUnderAttack(gameState, kingsPosition);
     }
 
-    
+
     function pieceUnderAttack(uint256 gameState, uint8 pos)
     public pure
     returns (bool) {
@@ -1117,7 +1250,7 @@ contract Chess {
         uint8 bitpos = fromPos * piece_bit_size;
 
         uint8 piece = (uint8)((gameState >> bitpos) & 0xF);
-        newGameState = gameState & ~(0xF << bitpos);
+        newGameState = gameState & ~(uint256(0xF) << bitpos);
 
         newGameState = setPosition(newGameState, toPos, piece);
     }
@@ -1133,7 +1266,7 @@ contract Chess {
     public pure
     returns (uint256)
     {
-        return gameState & ~(0xF << (pos * piece_bit_size));
+        return gameState & ~(uint256(0xF) << (pos * piece_bit_size));
     }
 
     /**
@@ -1149,7 +1282,7 @@ contract Chess {
     returns (uint256)
     {
         uint8 bitpos = pos * piece_bit_size;
-        return gameState & ~(0xF << bitpos) | ((uint256)(piece) << bitpos);
+        return gameState & ~(uint256(0xF) << bitpos) | ((uint256)(piece) << bitpos);
     }
 
     /**

@@ -240,7 +240,7 @@ contract TreasureMarket is
     }
 
     //@dev - moving tokens to the contract is the same gas as moving them to the platform owner, so just do that.
-    function tokenInstantBuy(uint256 _id, address _tokenAddress) public {
+    function tokenInstantBuy(uint256 _id, address _tokenAddress) public nonReentrant {
         //check SignatureChecker of sale. if its invalid, remove it.
         require(forSaleWithToken[_id] != address(0), "Item not for sale.");
         require(
@@ -272,11 +272,12 @@ contract TreasureMarket is
         paymentToken.transferFrom(_msgSender(), owner(), platformFee);
 
         //payment made. Move the NFT and emit
+        address sellerAddress = seller[_id];
         forSaleWithToken[_id] = address(0);
         seller[_id] = address(0);
-        treasure.safeTransferFrom(treasure.ownerOf(_id), _msgSender(), _id);
+        treasure.safeTransferFrom(address(this), _msgSender(), _id);
 
-        SaleCompleteWithToken(seller[_id], _id, _msgSender(), _tokenAddress);
+        emit SaleCompleteWithToken(sellerAddress, _id, _msgSender(), _tokenAddress);
     }
 
     //======== Admin functions ========//
