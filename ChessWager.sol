@@ -127,6 +127,13 @@ contract ChessWager is Ownable, ReentrancyGuard {
         "GameResult(uint256 gameId,bytes32 movesHash,uint8 outcome)"
     );
 
+    // The ZK settlement path: both players sign the MOVE LIST (not the outcome). The ZK
+    // proof then derives the outcome from exactly those moves, so a valid proof can't be
+    // bound to a game whose players didn't agree to its moves.
+    bytes32 private constant MOVES_COMMIT_TYPEHASH = keccak256(
+        "MovesCommit(uint256 gameId,bytes32 movesHash)"
+    );
+
     uint16  public feeBasisPoints       = 25;     // 2.5% out of 1000
     uint256 public accumulatedFeesETH;
     uint256 public accumulatedFeesCHSC;
@@ -728,10 +735,27 @@ contract ChessWager is Ownable, ReentrancyGuard {
      * @notice Settle a game via a trusted ZK verifier (e.g. RISC Zero).
      *         Called by ChessProofVerifier after on-chain proof verification.
      */
-    function settleFromVerifier(
+    /**
+     * @notice Settle a game from a verified ZK proof of its outcome.
+     * @dev Called by a trusted `ChessProofVerifier` AFTER it has verified the RISC Zero
+     *      proof. The proof's journal commits (gameId, white, black, outcome, movesHash);
+     *      the verifier passes those through here along with both players' signatures.
+     *
+     *      Soundness — why this can't be forged: the proof alone only attests
+     *      "movesHash's moves yield `outcome`", with gameId/players/moves chosen by the
+     *      prover. So we additionally require (a) the journal's players to BE this game's
+     *      players, and (b) both players' EIP-712 signatures over (gameId, movesHash) —
+     *      the moves commitment. An attacker can fabricate a winning game and a valid
+     *      proof, but cannot produce the victim's signature over its move hash.
+     */
+    function settleFromProof(
         uint256 gameId,
+        address white,
+        address black,
         uint8   outcome,
-        bytes32 movesHash
+        bytes32 movesHash,
+        bytes calldata sigWhite,
+        bytes calldata sigBlack
     )
         external
         nonReentrant
@@ -740,15 +764,28 @@ contract ChessWager is Ownable, ReentrancyGuard {
         require(trustedVerifiers[msg.sender], "ChessWager: untrusted verifier");
         require(outcome >= 1 && outcome <= 3, "ChessWager: bad outcome");
 
-        Game storage g     = games[gameId];
-        uint64      dispEnd = uint64(block.timestamp + disputeWindowSeconds);
+        Game storage g = games[gameId];
+        // Bind the proof's journal to THIS game's players.
+        require(white == g.white && black == g.black, "ChessWager: player mismatch");
+
+        // Moves commitment: both players must have signed (gameId, movesHash).
+        bytes32 structHash = keccak256(abi.encode(MOVES_COMMIT_TYPEHASH, gameId, movesHash));
+        bytes32 digest     = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        require(digest.recover(sigWhite) == white, "ChessWager: invalid white sig");
+        require(digest.recover(sigBlack) == black, "ChessWager: invalid black sig");
+
+        uint256  stake    = uint256(g.stakeAmount);
+        Currency currency = g.currency;
 
         g.movesHash        = movesHash;
         g.submittedOutcome = outcome;
-        g.disputeWindowEnd = dispEnd;
         g.state            = ChallengeState.Submitted;
+        g.disputeWindowEnd = uint64(block.timestamp);
 
-        emit GameSubmitted(gameId, msg.sender, movesHash, outcome, dispEnd);
+        emit GameSubmitted(gameId, msg.sender, movesHash, outcome, block.timestamp);
+
+        // Final: proof gives the outcome, both players agreed the moves — resolve now.
+        _resolveGame(gameId, outcome, white, black, stake, currency);
     }
 
     /**

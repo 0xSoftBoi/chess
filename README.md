@@ -224,6 +224,16 @@ darkChess.submitMove(gameId, move);
 
 Frontends read `whiteVisibility` / `blackVisibility` from `MoveMade` events and render only visible squares for each player. Full game state is always in the event for trustless reconstruction.
 
+> **The "fog" is cooperative, not cryptographic.** The full board is stored in plaintext
+> and emitted in every `MoveMade` event, so anyone reading chain state (or raw storage)
+> sees both sides — the visibility bitmasks are a client-rendering convention, not a
+> privacy guarantee. Move *legality* is still enforced on-chain (the contract sees the
+> whole board), so you can't cheat the rules; you just can't hide. You can't hide mutable
+> shared state on a public chain without ZK / FHE / MPC / trusted hardware — the
+> canonical cryptographic fog of war is [Dark Forest](https://blog.zkga.me/announcing-darkforest),
+> which keeps positions as hash commitments and proves moves in zero-knowledge. The
+> trade-offs are in [this write-up](https://0xsoftboi.github.io/blog/what-a-zk-proof-proves/).
+
 ---
 
 ## Player state encoding

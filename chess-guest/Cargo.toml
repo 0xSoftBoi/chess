@@ -10,5 +10,5 @@ path = "src/main.rs"
 [dependencies]
 risc0-zkvm = { version = "1", features = ["std"] }
 shakmaty   = "0.27"
-sha2       = "0.10"
+sha3       = "0.10"   # keccak256, matching the contract's movesHash convention
 hex        = "0.4"

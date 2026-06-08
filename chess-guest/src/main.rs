@@ -22,7 +22,7 @@
 #![no_main]
 
 use risc0_zkvm::guest::env;
-use sha2::{Digest, Sha256};
+use sha3::{Digest, Keccak256};
 use shakmaty::{
     Chess, Color, Move, Outcome, Position, Role, Square,
     san::SanPlus,
@@ -33,8 +33,12 @@ risc0_zkvm::guest::entry!(main);
 
 fn main() {
     // ── 1. Read private inputs ───────────────────────────────────────────────
-    let game_id: u64    = env::read();
-    let moves: Vec<u16> = env::read();
+    // game_id + the two player addresses are committed to the journal so the on-chain
+    // settlement can bind this proof to a specific game and its players.
+    let game_id: u64      = env::read();
+    let white:   [u8; 20] = env::read();
+    let black:   [u8; 20] = env::read();
+    let moves:   Vec<u16> = env::read();
 
     // ── 2. Decode and replay moves ───────────────────────────────────────────
     let mut pos = Chess::default();
@@ -90,28 +94,30 @@ fn main() {
     }
 
     // ── 3. Compute moves hash ────────────────────────────────────────────────
-    // keccak256-compatible: encode moves as packed big-endian uint16 array
-    // Note: we use SHA-256 here for native RISC Zero support; the Solidity side
-    // verifies using sha256(journal) not keccak256. The moves_hash stored in
-    // ChessWager is the keccak256 of the packed moves, but the journal hash used
-    // by the verifier is SHA-256 of the whole journal blob. They serve different
-    // purposes — moves_hash is for NFT provenance, not proof security.
+    // keccak256 of the packed big-endian uint16 move array — the SAME convention the
+    // contract uses (keccak256(abi.encodePacked(moves))), so the on-chain moves
+    // commitment the players sign matches what this journal commits. (This is now
+    // proof-binding, not just NFT provenance.)
     let mut moves_bytes = Vec::with_capacity(moves.len() * 2);
     for &m in &moves {
         moves_bytes.push((m >> 8) as u8);
         moves_bytes.push((m & 0xFF) as u8);
     }
-    let moves_hash: [u8; 32] = Sha256::digest(&moves_bytes).into();
+    let moves_hash: [u8; 32] = Keccak256::digest(&moves_bytes).into();
 
     // ── 4. ABI-encode journal outputs ────────────────────────────────────────
-    // Solidity ABI encoding for (uint256 gameId, uint8 outcome, bytes32 movesHash):
-    //   [0..32]   game_id (uint256, big-endian, left-padded)
-    //   [32..64]  outcome (uint8, left-padded to 32 bytes)
-    //   [64..96]  moves_hash (bytes32, exact)
-    let mut journal = [0u8; 96];
+    // abi.encode(uint256 gameId, address white, address black, uint8 outcome, bytes32 movesHash)
+    //   [0..32]    gameId  (uint256, big-endian, left-padded)
+    //   [32..64]   white   (address, right-aligned in the low 20 bytes)
+    //   [64..96]   black   (address)
+    //   [96..128]  outcome (uint8, left-padded)
+    //   [128..160] movesHash (bytes32)
+    let mut journal = [0u8; 160];
     journal[24..32].copy_from_slice(&game_id.to_be_bytes());
-    journal[63] = outcome_code;
-    journal[64..96].copy_from_slice(&moves_hash);
+    journal[44..64].copy_from_slice(&white);
+    journal[76..96].copy_from_slice(&black);
+    journal[127] = outcome_code;
+    journal[128..160].copy_from_slice(&moves_hash);
 
     env::commit_slice(&journal);
 }
