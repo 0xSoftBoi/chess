@@ -19,6 +19,18 @@ interface IChessValidator {
             uint32 playerState,
             uint32 opponentState
         );
+
+    /// Validate a Chess960 game from a Fischer-Random starting position id (0-959).
+    /// The deployed validator must be a Chess960 instance.
+    function checkChess960Game(uint16 positionId, uint16[] calldata moves)
+        external
+        pure
+        returns (
+            uint8  outcome,
+            uint256 gameState,
+            uint32 playerState,
+            uint32 opponentState
+        );
 }
 
 interface IChessRating {
@@ -128,6 +140,34 @@ contract ChessWager is Ownable, ReentrancyGuard {
     uint256 public acceptTimeoutSeconds = 3 days;
     uint256 public gameTimeoutSeconds   = 7 days;
     uint256 public disputeWindowSeconds = 1 hours;
+
+    // ── Chess960 fair starting-position draw (two-party commit-reveal) ──────────
+    //
+    // The 960 Fischer-Random setups are not equally advantageous, so the starting
+    // position must be picked by a source neither player can bias or pre-know. EVM
+    // has no native randomness, so we use a commit-reveal: each player commits
+    // keccak256(seed, salt) up front, both reveal, and the position is derived from
+    // the combined seeds. The one residual risk — a player who dislikes the (still
+    // hidden) result refusing to reveal — is handled by a reveal deadline + forfeit.
+    struct Chess960Draw {
+        bool    isChess960;     // marks this game as a Chess960 game
+        bool    whiteRevealed;
+        bool    blackRevealed;
+        bool    resolved;       // both revealed → positionId is final
+        uint16  positionId;     // 0-959, the drawn Fischer-Random position
+        uint64  revealDeadline; // set when the game becomes Active
+        bytes32 commitWhite;
+        bytes32 commitBlack;
+        bytes32 seedWhite;
+        bytes32 seedBlack;
+    }
+
+    mapping(uint256 => Chess960Draw) public chess960Draws;
+    uint256 public revealWindowSeconds = 1 days;
+
+    event Chess960Committed(uint256 indexed gameId, address indexed player);
+    event Chess960Revealed(uint256 indexed gameId, address indexed player);
+    event Chess960PositionDrawn(uint256 indexed gameId, uint16 positionId);
 
     uint256 public constant WIN_REWARD  = 10 ether; // 10 CHSC (18-decimal)
     uint256 public constant DRAW_REWARD =  5 ether; //  5 CHSC
@@ -354,6 +394,143 @@ contract ChessWager is Ownable, ReentrancyGuard {
         emit ChallengeAccepted(gameId, g.white, sender, deadline);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                    Chess960 fair starting-position draw
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Open a Chess960 challenge. `commit` = keccak256(abi.encode(seed, salt)); keep the
+    /// seed and salt secret until reveal. Mirrors createChallenge but records the
+    /// commitment that will (with the opponent's) pick a fair starting position.
+    function createChess960Challenge(
+        uint256  stakeAmount,
+        Currency currency,
+        address  opponent,
+        bytes32  commit
+    ) external payable nonReentrant notInActiveGame returns (uint256 gameId) {
+        require(commit != bytes32(0), "ChessWager: empty commit");
+        gameId = _openGame(stakeAmount, currency, opponent, _msgSender());
+        Chess960Draw storage d = chess960Draws[gameId];
+        d.isChess960  = true;
+        d.commitWhite = commit;
+        emit Chess960Committed(gameId, _msgSender());
+    }
+
+    /// Accept a Chess960 challenge, committing your own seed; starts the reveal window.
+    function acceptChess960Challenge(uint256 gameId, bytes32 commit)
+        external payable nonReentrant notInActiveGame
+        inState(gameId, ChallengeState.Open)
+    {
+        require(commit != bytes32(0), "ChessWager: empty commit");
+        Chess960Draw storage d = chess960Draws[gameId];
+        require(d.isChess960, "ChessWager: not a Chess960 game");
+        _joinGame(gameId, _msgSender());
+        d.commitBlack    = commit;
+        d.revealDeadline = uint64(block.timestamp + revealWindowSeconds);
+        emit Chess960Committed(gameId, _msgSender());
+    }
+
+    /// Reveal your seed. When both are in, the position is drawn from the combined
+    /// seeds — unbiasable, because each side committed before seeing the other's seed,
+    /// so neither can steer the result and neither knew it when they committed.
+    function revealChess960Seed(uint256 gameId, bytes32 seed, bytes32 salt)
+        external nonReentrant inState(gameId, ChallengeState.Active)
+    {
+        Chess960Draw storage d = chess960Draws[gameId];
+        require(d.isChess960 && !d.resolved, "ChessWager: no open draw");
+        Game storage g = games[gameId];
+        address sender = _msgSender();
+        bytes32 h = keccak256(abi.encode(seed, salt));
+
+        if (sender == g.white) {
+            require(!d.whiteRevealed, "ChessWager: already revealed");
+            require(h == d.commitWhite, "ChessWager: bad reveal");
+            d.seedWhite = seed;
+            d.whiteRevealed = true;
+        } else if (sender == g.black) {
+            require(!d.blackRevealed, "ChessWager: already revealed");
+            require(h == d.commitBlack, "ChessWager: bad reveal");
+            d.seedBlack = seed;
+            d.blackRevealed = true;
+        } else {
+            revert("ChessWager: not a player");
+        }
+        emit Chess960Revealed(gameId, sender);
+
+        if (d.whiteRevealed && d.blackRevealed) {
+            d.positionId = uint16(uint256(keccak256(
+                abi.encode(d.seedWhite, d.seedBlack, gameId, address(this))
+            )) % 960);
+            d.resolved = true;
+            emit Chess960PositionDrawn(gameId, d.positionId);
+        }
+    }
+
+    /// If one player reveals and the other lets the reveal window lapse, the revealer
+    /// wins by forfeit. This is the on-chain answer to the last-revealer abort: a player
+    /// who dislikes the still-secret draw cannot quietly stall to dodge it.
+    function claimChess960RevealTimeout(uint256 gameId)
+        external nonReentrant inState(gameId, ChallengeState.Active)
+    {
+        Chess960Draw storage d = chess960Draws[gameId];
+        require(d.isChess960 && !d.resolved, "ChessWager: draw already resolved");
+        require(block.timestamp > d.revealDeadline, "ChessWager: reveal window still open");
+        require(d.whiteRevealed != d.blackRevealed, "ChessWager: not a one-sided stall");
+
+        Game storage g = games[gameId];
+        uint8 outcome = d.whiteRevealed ? 2 : 3; // 2 = white win, 3 = black win
+        d.resolved = true;
+        _resolveGame(gameId, outcome, g.white, g.black, uint256(g.stakeAmount), g.currency);
+    }
+
+    // ── shared stake/open helpers (used by the standard and Chess960 entries) ──
+    function _openGame(uint256 stakeAmount, Currency currency, address opponent, address sender)
+        internal returns (uint256 gameId)
+    {
+        require(stakeAmount > 0, "ChessWager: stake must be > 0");
+        require(stakeAmount <= type(uint96).max, "ChessWager: stake overflow");
+        if (currency == Currency.ETH) {
+            require(msg.value == stakeAmount, "ChessWager: ETH value mismatch");
+        } else {
+            require(msg.value == 0, "ChessWager: ETH must be 0 for CHSC stake");
+            require(address(chessCoin) != address(0), "ChessWager: chessCoin not set");
+            require(chessCoin.transferFrom(sender, address(this), stakeAmount), "ChessWager: CHSC transfer failed");
+        }
+        gameIdCounter += 1;
+        gameId = gameIdCounter;
+        uint32 deadline = uint32(block.timestamp + acceptTimeoutSeconds);
+        Game memory g;
+        g.white          = sender;
+        g.stakeAmount    = uint96(stakeAmount);
+        g.createdAt      = uint64(block.timestamp);
+        g.acceptDeadline = deadline;
+        g.state          = ChallengeState.Open;
+        g.currency       = currency;
+        games[gameId]               = g;
+        gameAllowedOpponent[gameId] = opponent;
+        playerActiveGame[sender]    = gameId;
+        emit ChallengeCreated(gameId, sender, stakeAmount, currency, deadline);
+    }
+
+    function _joinGame(uint256 gameId, address sender) internal {
+        Game storage g = games[gameId];
+        require(block.timestamp <= g.acceptDeadline, "ChessWager: accept window expired");
+        require(sender != g.white, "ChessWager: cannot accept own challenge");
+        address allowed = gameAllowedOpponent[gameId];
+        if (allowed != address(0)) require(sender == allowed, "ChessWager: not the allowed opponent");
+        uint256 stake = uint256(g.stakeAmount);
+        if (g.currency == Currency.ETH) {
+            require(msg.value == stake, "ChessWager: ETH value mismatch");
+        } else {
+            require(msg.value == 0, "ChessWager: ETH must be 0 for CHSC stake");
+            require(chessCoin.transferFrom(sender, address(this), stake), "ChessWager: CHSC transfer failed");
+        }
+        g.black        = sender;
+        g.gameDeadline = uint64(block.timestamp + gameTimeoutSeconds);
+        g.state        = ChallengeState.Active;
+        playerActiveGame[sender] = gameId;
+        emit ChallengeAccepted(gameId, g.white, sender, g.gameDeadline);
+    }
+
     /**
      * @notice Cancel an open challenge (creator only). Refunds stake.
      */
@@ -412,15 +589,30 @@ contract ChessWager is Ownable, ReentrancyGuard {
     {
         require(gasleft() > 500_000, "ChessWager: insufficient gas");
 
+        Chess960Draw storage draw = chess960Draws[gameId];
         uint8 outcome;
-        try chessValidator.checkGameFromStart(moves) returns (
-            uint8 o, uint256, uint32, uint32
-        ) {
-            outcome = o;
-        } catch Error(string memory reason) {
-            revert(string(abi.encodePacked("ChessWager: validator error — ", reason)));
-        } catch {
-            revert("ChessWager: invalid move sequence");
+        if (draw.isChess960) {
+            // Validate from the fairly-drawn Fischer-Random position, not the standard start.
+            require(draw.resolved, "ChessWager: Chess960 position not drawn yet");
+            try chessValidator.checkChess960Game(draw.positionId, moves) returns (
+                uint8 o, uint256, uint32, uint32
+            ) {
+                outcome = o;
+            } catch Error(string memory reason) {
+                revert(string(abi.encodePacked("ChessWager: validator error - ", reason)));
+            } catch {
+                revert("ChessWager: invalid move sequence");
+            }
+        } else {
+            try chessValidator.checkGameFromStart(moves) returns (
+                uint8 o, uint256, uint32, uint32
+            ) {
+                outcome = o;
+            } catch Error(string memory reason) {
+                revert(string(abi.encodePacked("ChessWager: validator error - ", reason)));
+            } catch {
+                revert("ChessWager: invalid move sequence");
+            }
         }
 
         require(outcome != 0, "ChessWager: game is not conclusive");
@@ -458,7 +650,7 @@ contract ChessWager is Ownable, ReentrancyGuard {
         ) {
             outcome = o;
         } catch Error(string memory reason) {
-            revert(string(abi.encodePacked("ChessWager: validator error — ", reason)));
+            revert(string(abi.encodePacked("ChessWager: validator error - ", reason)));
         } catch {
             revert("ChessWager: invalid move sequence");
         }
