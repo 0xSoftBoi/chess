@@ -4,141 +4,85 @@ pragma solidity ^0.8.20;
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
+/// @notice RISC Zero on-chain verifier interface (risc0-ethereum). `verify` reverts on
+///         failure. Use the canonical deployed verifier / router for your chain.
+interface IRiscZeroVerifier {
+    function verify(bytes calldata seal, bytes32 imageId, bytes32 journalDigest) external view;
+}
+
+/// @notice ChessWager settlement entry for the ZK path.
+interface IChessWager {
+    function settleFromProof(
+        uint256 gameId,
+        address white,
+        address black,
+        uint8   outcome,
+        bytes32 movesHash,
+        bytes calldata sigWhite,
+        bytes calldata sigBlack
+    ) external;
+}
+
 /**
  * @title ChessProofVerifier
  * @notice On-chain wrapper for RISC Zero ZK proof verification of chess games.
  *
- *         Architecture
- *         ────────────
- *         Off-chain (Rust / RISC Zero guest program):
- *           1. Build the chess-guest program (see chess-guest/ directory)
- *           2. Feed it the uint16[] moves array as private input
- *           3. Guest validates the full game using shakmaty
- *           4. Guest commits (outcome: uint8, movesHash: bytes32) as public journal
- *           5. Submit proof receipt to Bonsai or self-hosted prover
+ *         Off-chain (chess-guest, Rust): replay the moves, and commit the journal
+ *           abi.encode(uint256 gameId, address white, address black, uint8 outcome, bytes32 movesHash)
+ *         where movesHash = keccak256(packed uint16 moves).
  *
- *         On-chain (this contract):
- *           1. Receive the proof receipt + journal
- *           2. Forward to RISC Zero verifier contract (already deployed on major networks)
- *           3. Decode (outcome, movesHash) from the journal
- *           4. Call ChessWager.settleFromVerifier() to settle the game
+ *         On-chain (this contract): verify the proof against the pinned IMAGE_ID, decode
+ *         the journal, and hand it to ChessWager.settleFromProof — which BINDS it to the
+ *         game (players must match) and to a moves commitment (both players' signatures
+ *         over (gameId, movesHash)). The proof alone proves only "these moves yield this
+ *         outcome"; the binding is what stops a valid proof being forged onto another
+ *         game. See ChessWager.settleFromProof and the write-up on journal binding.
  *
- *         Gas comparison:
- *           - submitGame() with 60-move game:  ~500,000 gas
- *           - verifyAndSettle() with ZK proof: ~3,000-5,000 gas
- *
- * @dev The IMAGE_ID is derived deterministically from the compiled chess-guest
- *      binary. It is set at deployment and cannot change.
- *
- *      RISC Zero verifier addresses (as of 2025):
- *        Mainnet:  0x8EaB2D97Dfce405A1692a21b3ff3A172d593D319
- *        Sepolia:  0x925d8331ddc0a1F0d96E68CF073DFE1d92b69187
- *        Base:     0x0b144e07A0826182176AB3e27021fA07F9EDE7Aa
- *        Arbitrum: 0x0b144e07A0826182176AB3e27021fA07F9EDE7Aa
+ * @dev IMAGE_ID is the chess-guest image id, pinned at deploy. `verifier` should be the
+ *      canonical RISC Zero verifier/router for the chain (immutable here).
  */
 contract ChessProofVerifier is Ownable, ReentrancyGuard {
-
-    // =========================================================================
-    // Interfaces
-    // =========================================================================
-
-    /// @notice RISC Zero on-chain verifier interface.
-    interface IRiscZeroVerifier {
-        /**
-         * @notice Verify a RISC Zero STARK proof.
-         * @param seal        The proof seal (encoded STARK).
-         * @param imageId     The guest image ID — identifies which program was run.
-         * @param journalHash SHA-256 hash of the public journal outputs.
-         */
-        function verify(
-            bytes calldata seal,
-            bytes32        imageId,
-            bytes32        journalHash
-        ) external view;
-    }
-
-    /// @notice ChessWager settlement interface — settleFromVerifier is the ZK path.
-    interface IChessWager {
-        function settleFromVerifier(
-            uint256 gameId,
-            uint8   outcome,
-            bytes32 movesHash
-        ) external;
-    }
-
-    // =========================================================================
-    // State
-    // =========================================================================
-
     IRiscZeroVerifier public immutable verifier;
     IChessWager       public immutable wager;
+    bytes32           public immutable IMAGE_ID;
 
-    /// @notice Image ID of the compiled chess-guest binary (set at deploy).
-    bytes32 public immutable IMAGE_ID;
+    event ProofVerified(uint256 indexed gameId, uint8 outcome, bytes32 movesHash);
 
-    // =========================================================================
-    // Events
-    // =========================================================================
-
-    event ProofVerified(
-        uint256 indexed gameId,
-        uint8   outcome,
-        bytes32 movesHash
-    );
-
-    // =========================================================================
-    // Constructor
-    // =========================================================================
-
-    /**
-     * @param _verifier RISC Zero on-chain verifier contract address.
-     * @param _wager    ChessWager contract address.
-     * @param _imageId  IMAGE_ID of the chess-guest binary (from build output).
-     */
-    constructor(
-        address _verifier,
-        address _wager,
-        bytes32 _imageId
-    ) Ownable() {
+    constructor(address _verifier, address _wager, bytes32 _imageId) Ownable() {
         require(_verifier != address(0), "ChessProofVerifier: zero verifier");
         require(_wager    != address(0), "ChessProofVerifier: zero wager");
         require(_imageId  != bytes32(0), "ChessProofVerifier: zero imageId");
-
         verifier = IRiscZeroVerifier(_verifier);
         wager    = IChessWager(_wager);
         IMAGE_ID = _imageId;
     }
 
-    // =========================================================================
-    // Core function
-    // =========================================================================
-
     /**
      * @notice Verify a ZK proof of game validity and settle the wager.
-     *
-     *         The journal must be ABI-encoded as: abi.encode(uint256 gameId, uint8 outcome, bytes32 movesHash)
-     *         The proof must have been generated by the chess-guest program for the
-     *         same IMAGE_ID that was set at deployment.
-     *
-     * @param seal    RISC Zero STARK proof seal.
-     * @param journal ABI-encoded public outputs: (gameId, outcome, movesHash).
+     * @param seal     RISC Zero proof seal.
+     * @param journal  abi.encode(gameId, white, black, outcome, movesHash) — the guest's
+     *                 public output.
+     * @param sigWhite White's EIP-712 signature over (gameId, movesHash) (moves commitment).
+     * @param sigBlack Black's EIP-712 signature over (gameId, movesHash).
      */
     function verifyAndSettle(
         bytes calldata seal,
-        bytes calldata journal
+        bytes calldata journal,
+        bytes calldata sigWhite,
+        bytes calldata sigBlack
     ) external nonReentrant {
-        // 1. Verify the ZK proof against the committed journal
+        // 1. The proof must be of the pinned guest program over exactly this journal.
         verifier.verify(seal, IMAGE_ID, sha256(journal));
 
-        // 2. Decode public journal outputs
-        (uint256 gameId, uint8 outcome, bytes32 movesHash) =
-            abi.decode(journal, (uint256, uint8, bytes32));
+        // 2. Decode the (bound) public outputs.
+        (uint256 gameId, address white, address black, uint8 outcome, bytes32 movesHash) =
+            abi.decode(journal, (uint256, address, address, uint8, bytes32));
 
         require(outcome >= 1 && outcome <= 3, "ChessProofVerifier: invalid outcome in journal");
-
         emit ProofVerified(gameId, outcome, movesHash);
 
-        // 3. Settle the game in ChessWager
-        wager.settleFromVerifier(gameId, outcome, movesHash);
+        // 3. Settle — the wager binds the journal to the game's players and the players'
+        //    signed moves commitment.
+        wager.settleFromProof(gameId, white, black, outcome, movesHash, sigWhite, sigBlack);
     }
 }
