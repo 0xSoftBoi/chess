@@ -257,6 +257,38 @@ Fischer Random Chess uses standard rules with a randomly shuffled back rank (960
 string memory pos = chess960.getPositionString(518);
 ```
 
+### Fair position selection (the randomness problem)
+
+`getStartingPosition` only *generates* a board from a position id — it doesn't decide
+*which* of the 960 you get, and the 960 setups aren't equally advantageous, so whoever
+picks (or pre-knows) the position has an edge. EVM has no native randomness, so
+`ChessWager` picks it with a **two-party commit-reveal**:
+
+```
+createChess960Challenge(stake, currency, opponent, commit)  // white commits keccak(seed, salt)
+acceptChess960Challenge(gameId, commit)                     // black commits, reveal window opens
+revealChess960Seed(gameId, seed, salt)  x2                  // positionId = keccak(seedW, seedB, gameId, this) % 960
+```
+
+Neither player can bias or pre-know the result (each commits before seeing the other's
+seed). The one residual risk — a player who dislikes the still-secret draw refusing to
+reveal — is handled by `claimChess960RevealTimeout`: if one reveals and the other stalls
+past the window, the revealer wins by forfeit. For a *single-party* draw (a lobby), use
+an external VRF via [`IRandomnessSource`](IRandomnessSource.sol) instead. The trade-offs
+across commit-reveal / VRF / beacon / native RNG are written up
+[here](https://0xsoftboi.github.io/blog/the-on-chain-randomness-landscape/).
+
+### Build & test
+
+```bash
+forge install OpenZeppelin/openzeppelin-contracts@v4.9.6
+forge install foundry-rs/forge-std
+forge test        # Chess960 fair-draw suite
+```
+
+The `foundry.toml` scopes compilation to the chess core (the Treasure NFT marketplace
+and the RISC Zero verifier are excluded from that profile).
+
 ---
 
 ## Deployment order
